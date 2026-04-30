@@ -81,9 +81,11 @@ Add to `claude_desktop_config.json`:
 
 ## Environment Variables
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `RTSP_URLS` | No | Comma-separated list of RTSP URLs. Format: `name=url` or just `url`. Credentials can be embedded in the URL. |
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `RTSP_URLS` | No | — | RTSP URL list. Format: `name=url`, separated by commas or semicolons. Credentials can be embedded in the URL. |
+| `RTSP_MAX_RETRIES` | No | `3` | Max retry attempts on capture failure (0 = no retry). Total attempts = retries + 1. |
+| `RTSP_RETRY_BASE_DELAY_MS` | No | `1000` | Base delay (ms) for exponential backoff between retries. Actual delay = `base × 2^(attempt-1)`. |
 
 ### RTSP_URLS Format
 
@@ -104,6 +106,8 @@ RTSP_URLS="cam1=rtsp://192.168.1.10/stream,rtsp://192.168.1.11/live"
 
 Capture a single frame from an RTSP stream and return it as a base64-encoded image.
 
+The tool description is generated dynamically at startup — it always lists every camera name configured in `RTSP_URLS`, so the AI client already knows all available servers from `tools/list` without a separate discovery call.
+
 **Parameters:**
 
 | Parameter | Type | Required | Default | Description |
@@ -113,7 +117,7 @@ Capture a single frame from an RTSP stream and return it as a base64-encoded ima
 | `format` | `jpeg` / `png` / `webp` | No | `jpeg` | Output image format |
 | `timeout` | integer | No | `10000` | Capture timeout in ms (1000–60000) |
 
-\* At least one of `server` or `url` is required.
+\* At least one of `server` or `url` is required. When only one source is configured in `RTSP_URLS`, it will be used automatically even if `server` is omitted.
 
 **Example usage in an MCP client:**
 
@@ -168,9 +172,11 @@ sudo pacman -S ffmpeg
 ## How It Works
 
 1. On startup, the server parses `RTSP_URLS` into named camera sources
-2. When `get_frame` is called, it spawns `ffmpeg` to connect to the RTSP stream via TCP and extract a single frame
-3. The captured frame is returned as a base64-encoded image in the MCP response
-4. For non-JPEG formats, the frame is converted using [sharp](https://sharp.pixelplumbing.com/)
+2. The `get_frame` tool description is generated dynamically at startup, embedding all configured camera names — so `tools/list` already tells the client exactly which servers are available
+3. When `get_frame` is called, it spawns `ffmpeg` to connect to the RTSP stream via TCP and extract a single frame
+4. The captured frame is returned as a base64-encoded image in the MCP response
+5. On failure, the capture is retried with exponential backoff up to `RTSP_MAX_RETRIES` times
+6. For non-JPEG formats, the frame is converted using [sharp](https://sharp.pixelplumbing.com/)
 
 ## License
 

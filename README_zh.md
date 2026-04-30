@@ -81,9 +81,11 @@ npx @ptbsare/rtsp-mcp-server
 
 ## 环境变量
 
-| 变量 | 必填 | 说明 |
-|------|------|------|
-| `RTSP_URLS` | 否 | 逗号分隔的 RTSP URL 列表。格式：`name=url` 或直接 `url`。URL 中可内嵌认证信息。 |
+| 变量 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `RTSP_URLS` | 否 | — | RTSP URL 列表，分号 `;` 或逗号 `,` 分隔。格式：`name=url` 或直接 `url`。URL 中可内嵌认证信息。 |
+| `RTSP_MAX_RETRIES` | 否 | `3` | 抓帧失败时最大重试次数（0 = 不重试）。总尝试次数 = 重试次数 + 1。 |
+| `RTSP_RETRY_BASE_DELAY_MS` | 否 | `1000` | 指数退避基础延迟（毫秒）。实际延迟 = `base × 2^(attempt-1)`。 |
 
 ### RTSP_URLS 格式
 
@@ -100,6 +102,21 @@ RTSP_URLS="cam1=rtsp://192.168.1.10/stream,rtsp://192.168.1.11/live"
 
 ## 工具
 
+### `list_servers`
+
+列出所有通过 `RTSP_URLS` 环境变量配置的 RTSP 视频源。如果不知道有哪些可用的 server 名称，请先调用此工具。
+
+**参数：** 无
+
+**示例输出：**
+```
+Configured RTSP sources (2):
+1. 前门 — rtsp://192.168.1.10:554/stream1
+2. 后院 — rtsp://192.168.1.11:554/live
+
+Use the "server" name (e.g. "前门") in the get_frame tool.
+```
+
 ### `get_frame`
 
 从 RTSP 视频流抓取单帧画面，返回 base64 编码的图像。
@@ -113,7 +130,7 @@ RTSP_URLS="cam1=rtsp://192.168.1.10/stream,rtsp://192.168.1.11/live"
 | `format` | `jpeg` / `png` / `webp` | 否 | `jpeg` | 输出图像格式 |
 | `timeout` | integer | 否 | `10000` | 抓帧超时时间，单位毫秒（1000–60000） |
 
-\* `server` 和 `url` 至少需要提供一个。
+\* `server` 和 `url` 至少需要提供一个。当 `RTSP_URLS` 中仅配置了一个源时，即使省略 `server` 也会自动使用。
 
 **使用示例（在 MCP 客户端中）：**
 

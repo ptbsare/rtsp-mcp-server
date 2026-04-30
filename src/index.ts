@@ -6,35 +6,62 @@ import { z } from "zod";
 import { spawn } from "node:child_process";
 import sharp from "sharp";
 
-/**
- * Parse RTSP_URLS environment variable.
- * URLs are separated by commas. Each entry can be:
- *   - a plain URL: rtsp://host/path
- *   - a named entry: name=url  (e.g. kitchen=rtsp://user:pass@host/stream)
- *
- * The URL may contain embedded credentials (rtsp://user:pass@host/path).
- */
+// ── Environment config ──────────────────────────────────────────────
+
+const RTSP_MAX_RETRIES = (() => {
+  const v = parseInt(process.env.RTSP_MAX_RETRIES ?? "", 10);
+  return Number.isFinite(v) && v >= 0 ? v : 3;
+})();
+
+const RTSP_RETRY_BASE_DELAY_MS = (() => {
+  const v = parseInt(process.env.RTSP_RETRY_BASE_DELAY_MS ?? "", 10);
+  return Number.isFinite(v) && v >= 0 ? v : 1000;
+})();
+
+// ── Source parsing ───────────────────────────────────────────────────
 
 interface RtspSource {
   name: string;
   url: string;
 }
 
+/**
+ * Parse RTSP_URLS environment variable.
+ *
+ * Entries are separated by semicolons (;) or commas (,).
+ * Each entry can be:
+ *   name=url   — named source (e.g. kitchen=rtsp://host/stream?user=a&pwd=b)
+ *   url        — auto-named from URL path
+ *
+ * The parser uses the FIRST "=" to split name from url, so query-string
+ * parameters like &user=X&pwd=Y inside the URL are preserved intact.
+ *
+ * Examples:
+ *   RTSP_URLS="cam1=rtsp://host/a;cam2=rtsp://host/b"
+ *   RTSP_URLS="rtsp://admin:pass@host/stream?token=abc"
+ *   RTSP_URLS="厨房=rtsp://host/a?user=admin&pwd=secret,客厅=rtsp://host/b"
+ */
 function parseRtspUrls(envValue: string | undefined): RtspSource[] {
   if (!envValue || envValue.trim() === "") return [];
 
   return envValue
-    .split(",")
+    .split(/[,;]/)
     .map((s) => s.trim())
     .filter((s) => s.length > 0)
     .map((entry, idx) => {
+      // Look for the first "="
       const eqIdx = entry.indexOf("=");
-      if (eqIdx > 0 && !entry.substring(0, eqIdx).includes("://")) {
-        const name = entry.substring(0, eqIdx).trim();
-        const url = entry.substring(eqIdx + 1).trim();
-        return { name, url };
+      if (eqIdx > 0) {
+        const beforeEq = entry.substring(0, eqIdx);
+        // If the part before "=" contains "://", this is a bare URL like
+        // rtsp://host/path?query=value — NOT a name=url pair.
+        if (!beforeEq.includes("://")) {
+          const name = beforeEq.trim();
+          const url = entry.substring(eqIdx + 1).trim();
+          return { name, url };
+        }
       }
-      // Auto-generate a name from the URL
+      // Bare URL — auto-generate a name from the URL path
       try {
         const u = new URL(entry);
         const pathPart = u.pathname.replace(/\//g, "_").replace(/^_/, "");
@@ -46,14 +73,12 @@ function parseRtspUrls(envValue: string | undefined): RtspSource[] {
     });
 }
 
+// ── ffmpeg frame capture ─────────────────────────────────────────────
+
 /**
- * Grab a single frame from an RTSP URL using ffmpeg, return raw JPEG/PNG/WebP buffer.
+ * Single attempt: grab one JPEG frame from an RTSP URL via ffmpeg.
  */
-async function grabFrame(
-  url: string,
-  format: "jpeg" | "png" | "webp" = "jpeg",
-  timeoutMs: number = 10000,
-): Promise<Buffer> {
+function grabFrameOnce(url: string, timeoutMs: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const args = [
       "-rtsp_transport", "tcp",
@@ -66,7 +91,6 @@ async function grabFrame(
 
     const proc = spawn("ffmpeg", args, {
       stdio: ["ignore", "pipe", "pipe"],
-      timeout: timeoutMs,
     });
 
     const chunks: Buffer[] = [];
@@ -79,37 +103,20 @@ async function grabFrame(
 
     const timer = setTimeout(() => {
       proc.kill("SIGKILL");
-      reject(new Error(`ffmpeg timed out after ${timeoutMs}ms`));
     }, timeoutMs);
 
-    proc.on("close", async (code) => {
+    proc.on("close", (code) => {
       clearTimeout(timer);
       if (code !== 0 && code !== null) {
         return reject(
-          new Error(`ffmpeg exited with code ${code}: ${stderrData.slice(-500)}`),
+          new Error(`ffmpeg exited with code ${code}: ${stderrData.slice(-300)}`),
         );
       }
-
       const raw = Buffer.concat(chunks);
       if (raw.length === 0) {
         return reject(new Error("ffmpeg produced no output frame"));
       }
-
-      // If requested format is jpeg and ffmpeg already output mjpeg, just return as-is
-      if (format === "jpeg") {
-        return resolve(raw);
-      }
-
-      // Convert to requested format via sharp
-      try {
-        const converted = await sharp(raw)
-          .toFormat(format, { quality: 85 })
-          .toBuffer();
-        resolve(converted);
-      } catch (e) {
-        // Fall back to raw JPEG if conversion fails
-        resolve(raw);
-      }
+      resolve(raw);
     });
 
     proc.on("error", (err) => {
@@ -119,33 +126,139 @@ async function grabFrame(
   });
 }
 
-// Build source list from environment
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Grab a frame with exponential-backoff retry.
+ *
+ * Attempt 0 runs immediately. On each subsequent attempt the wait is:
+ *   baseDelay × 2^(attempt-1)
+ *
+ * Defaults: 3 retries (4 total attempts), 1 s base delay.
+ * Configurable via RTSP_MAX_RETRIES / RTSP_RETRY_BASE_DELAY_MS.
+ */
+async function grabFrameWithRetry(
+  url: string,
+  timeoutMs: number,
+  maxRetries = RTSP_MAX_RETRIES,
+  baseDelay = RTSP_RETRY_BASE_DELAY_MS,
+): Promise<{ frame: Buffer; attempt: number }> {
+  let lastError: Error | undefined;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (attempt > 0) {
+      const backoff = baseDelay * Math.pow(2, attempt - 1);
+      console.error(`[retry ${attempt}/${maxRetries}] waiting ${backoff}ms...`);
+      await sleep(backoff);
+    }
+
+    try {
+      const frame = await grabFrameOnce(url, timeoutMs);
+      return { frame, attempt };
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      console.error(`[attempt ${attempt + 1}/${maxRetries + 1}] ${lastError.message}`);
+    }
+  }
+
+  throw lastError ?? new Error("grabFrame failed");
+}
+
+// ── Image format conversion ─────────────────────────────────────────
+
+const MIME_MAP: Record<string, string> = {
+  jpeg: "image/jpeg",
+  png: "image/png",
+  webp: "image/webp",
+};
+
+async function convertFrame(
+  jpegBuf: Buffer,
+  format: "jpeg" | "png" | "webp",
+): Promise<Buffer> {
+  if (format === "jpeg") return jpegBuf;
+  try {
+    return await sharp(jpegBuf).toFormat(format, { quality: 85 }).toBuffer();
+  } catch {
+    return jpegBuf;
+  }
+}
+
+// ── Build source list from environment ───────────────────────────────
+
 const sources = parseRtspUrls(process.env.RTSP_URLS);
 
-// Create MCP server
+// ── MCP server ───────────────────────────────────────────────────────
+
 const server = new McpServer({
   name: "rtsp-mcp-server",
   version: "0.1.0",
 });
 
-// Register get_frame tool
+// ── Tool: get_frame ──────────────────────────────────────────────────
+
+// Build description dynamically so list_tools already carries source info
+function buildGetFrameDescription(): string {
+  const lines: string[] = [
+    "Capture a single frame from an RTSP camera stream and return it as an image.",
+  ];
+
+  if (sources.length === 0) {
+    lines.push(
+      "No sources pre-configured. You must provide a full RTSP 'url' parameter.",
+    );
+  } else if (sources.length === 1) {
+    lines.push(
+      `1 source configured: "${sources[0].name}". ` +
+        `The 'server' parameter defaults to "${sources[0].name}" if omitted.`,
+    );
+  } else {
+    lines.push(
+      `${sources.length} sources configured — pass the 'server' name or a direct 'url':`,
+    );
+    for (const s of sources) {
+      const masked = s.url.replace(/\/\/([^:]+):([^@]+)@/, "//$1:***@");
+      lines.push(`  • ${s.name} — ${masked}`);
+    }
+  }
+
+  lines.push(
+    `Automatically retries on failure (up to ${RTSP_MAX_RETRIES} retries, ` +
+      `exponential backoff base ${RTSP_RETRY_BASE_DELAY_MS}ms).`,
+  );
+
+  return lines.join("\n");
+}
+
+// Build server parameter description with available names inline
+function buildServerParamDesc(): string {
+  if (sources.length === 1) {
+    return `RTSP source name. Defaults to "${sources[0].name}" if omitted.`;
+  }
+  if (sources.length > 1) {
+    return (
+      `RTSP source name. Available: ${sources.map((s) => `"${s.name}"`).join(", ")}. ` +
+      `Pass the exact name from this list.`
+    );
+  }
+  return "RTSP source name (none configured via RTSP_URLS).";
+}
+
 server.tool(
   "get_frame",
-  "Capture a single frame from an RTSP camera stream and return it as an image. " +
-    "Provide either a 'server' name (from the configured RTSP_URLS list) or a full 'url' directly.",
+  buildGetFrameDescription(),
   {
     server: z
       .string()
       .optional()
-      .describe(
-        "Name of the RTSP source from the configured list. " +
-          `Available: ${sources.map((s) => s.name).join(", ") || "(none configured)"}`,
-      ),
+      .describe(buildServerParamDesc()),
     url: z
       .string()
       .optional()
       .describe(
-        "Direct RTSP URL to capture from (may include credentials, e.g. rtsp://user:pass@host/stream). " +
+        "Direct RTSP URL to capture from (may include embedded credentials and query parameters). " +
           "Overrides 'server' if both are provided.",
       ),
     format: z
@@ -158,83 +271,99 @@ server.tool(
       .min(1000)
       .max(60000)
       .default(10000)
-      .describe("Capture timeout in milliseconds (1000–60000, default: 10000)"),
+      .describe("Per-attempt capture timeout in milliseconds (1000–60000, default: 10000)"),
   },
   async ({ server: serverName, url, format, timeout }) => {
-    // Resolve the target URL
     let targetUrl = url;
 
     if (!targetUrl) {
-      if (!serverName) {
+      if (!serverName && sources.length === 1) {
+        targetUrl = sources[0].url;
+      } else if (!serverName) {
         return {
           content: [
             {
               type: "text" as const,
               text:
                 sources.length > 0
-                  ? `Please specify either a 'server' name (${sources.map((s) => `"${s.name}"`).join(", ")}) or a direct 'url'.`
+                  ? `Please specify a 'server' name (${sources.map((s) => `"${s.name}"`).join(", ")}) or a direct 'url'.`
                   : "No RTSP sources are configured in RTSP_URLS. Please provide a 'url' parameter directly.",
             },
           ],
           isError: true,
         };
+      } else {
+        const source = sources.find(
+          (s) => s.name.toLowerCase() === serverName.toLowerCase(),
+        );
+        if (!source) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Unknown server "${serverName}". Available: ${sources.map((s) => s.name).join(", ")}.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        targetUrl = source.url;
       }
-
-      const source = sources.find(
-        (s) => s.name.toLowerCase() === serverName.toLowerCase(),
-      );
-      if (!source) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Unknown server "${serverName}". Available: ${sources.map((s) => s.name).join(", ")}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-      targetUrl = source.url;
     }
 
     try {
-      const frame = await grabFrame(targetUrl, format ?? "jpeg", timeout ?? 10000);
+      const { frame: jpegFrame, attempt } = await grabFrameWithRetry(
+        targetUrl,
+        timeout ?? 10000,
+      );
 
-      // Determine MIME type
-      const mimeMap: Record<string, string> = {
-        jpeg: "image/jpeg",
-        png: "image/png",
-        webp: "image/webp",
-      };
-      const mime = mimeMap[format ?? "jpeg"] ?? "image/jpeg";
+      const outFormat = (format ?? "jpeg") as "jpeg" | "png" | "webp";
+      const frame = await convertFrame(jpegFrame, outFormat);
+      const mime = MIME_MAP[outFormat] ?? "image/jpeg";
 
-      return {
-        content: [
-          {
-            type: "image" as const,
-            data: frame.toString("base64"),
-            mimeType: mime,
-          },
-        ],
-      };
+      const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [];
+
+      if (attempt > 0) {
+        content.push({
+          type: "text" as const,
+          text: `Captured after ${attempt + 1} attempts (${attempt} ${attempt === 1 ? "retry" : "retries"}).`,
+        });
+      }
+
+      content.push({
+        type: "image" as const,
+        data: frame.toString("base64"),
+        mimeType: mime,
+      });
+
+      return { content };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       return {
-        content: [{ type: "text" as const, text: `Failed to capture frame: ${message}` }],
+        content: [
+          {
+            type: "text" as const,
+            text: `Failed to capture frame after ${RTSP_MAX_RETRIES + 1} attempts: ${message}`,
+          },
+        ],
         isError: true,
       };
     }
   },
 );
 
-// List available RTSP sources as a resource
+// ── Resource: rtsp://sources ────────────────────────────────────────
+
 server.resource("rtsp-sources", "rtsp://sources", async (uri) => ({
   contents: [
     {
       uri: uri.href,
       mimeType: "application/json",
       text: JSON.stringify(
-        sources.map((s) => ({ name: s.name, url: s.url.replace(/\/\/([^:]+):([^@]+)@/, "//$1:***@") })),
+        sources.map((s) => ({
+          name: s.name,
+          url: s.url.replace(/\/\/([^:]+):([^@]+)@/, "//$1:***@"),
+        })),
         null,
         2,
       ),
@@ -242,11 +371,13 @@ server.resource("rtsp-sources", "rtsp://sources", async (uri) => ({
   ],
 }));
 
-// Main entry
+// ── Main ─────────────────────────────────────────────────────────────
+
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("rtsp-mcp-server started (stdio transport)");
+  console.error(`Retry config: max=${RTSP_MAX_RETRIES}, base_delay=${RTSP_RETRY_BASE_DELAY_MS}ms`);
   if (sources.length > 0) {
     console.error(`Configured RTSP sources: ${sources.map((s) => s.name).join(", ")}`);
   } else {
