@@ -3,7 +3,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
+import { mkdirSync, existsSync, chmodSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+import { Readable } from "node:stream";
 import sharp from "sharp";
 
 // ── Environment config ──────────────────────────────────────────────
@@ -17,6 +21,107 @@ const RTSP_RETRY_BASE_DELAY_MS = (() => {
   const v = parseInt(process.env.RTSP_RETRY_BASE_DELAY_MS ?? "", 10);
   return Number.isFinite(v) && v >= 0 ? v : 1000;
 })();
+
+// ── ffmpeg discovery & auto-download ─────────────────────────────────
+
+const FFMPEG_DOWNLOAD_URL =
+  "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz";
+
+const FFMPEG_CACHE_DIR = join(homedir(), ".rtsp-mcp-server", "bin");
+const FFMPEG_CACHED_PATH = join(FFMPEG_CACHE_DIR, "ffmpeg");
+
+/** Cached absolute path to the ffmpeg binary (resolved once at startup). */
+let ffmpegPath = "ffmpeg";
+
+/** Check if `ffmpeg` exists in PATH. */
+function ffmpegExists(): Promise<boolean> {
+  return new Promise((resolve) => {
+    execFile("ffmpeg", ["-version"], { timeout: 5000 }, (err) => {
+      resolve(!err);
+    });
+  });
+}
+
+/** Download ffmpeg-static from BtbN, extract the binary, cache it. */
+async function downloadFfmpeg(): Promise<string> {
+  console.error(`Downloading ffmpeg from ${FFMPEG_DOWNLOAD_URL} ...`);
+  mkdirSync(FFMPEG_CACHE_DIR, { recursive: true });
+
+  const res = await fetch(FFMPEG_DOWNLOAD_URL);
+  if (!res.ok || !res.body) {
+    throw new Error(`Failed to download ffmpeg: HTTP ${res.status}`);
+  }
+
+  // Use tar to stream-decompress and extract only the ffmpeg binary.
+  // The tarball layout is: ffmpeg-master-latest-linux64-gpl/bin/ffmpeg
+  const tarProc = spawn(
+    "tar",
+    ["-xJf", "-", "--strip-components=2", "-C", FFMPEG_CACHE_DIR, "ffmpeg-master-latest-linux64-gpl/bin/ffmpeg"],
+    { stdio: ["pipe", "ignore", "pipe"] },
+  );
+
+  const nodeStream = Readable.fromWeb(res.body as any);
+  nodeStream.pipe(tarProc.stdin);
+
+  let stderr = "";
+  tarProc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+
+  await new Promise<void>((resolve, reject) => {
+    tarProc.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`tar exited with code ${code}: ${stderr.slice(-300)}`));
+    });
+    tarProc.on("error", reject);
+  });
+
+  chmodSync(FFMPEG_CACHED_PATH, 0o755);
+  console.error(`ffmpeg cached at ${FFMPEG_CACHED_PATH}`);
+  return FFMPEG_CACHED_PATH;
+}
+
+/**
+ * Ensure an ffmpeg binary is available.
+ *  1. Check PATH for system ffmpeg.
+ *  2. Check the local cache (~/.rtsp-mcp-server/bin/ffmpeg).
+ *  3. If on linux x64, auto-download from BtbN.
+ *  4. Otherwise throw with install instructions.
+ */
+async function ensureFfmpeg(): Promise<string> {
+  // 1. System ffmpeg
+  if (await ffmpegExists()) {
+    console.error("Using system ffmpeg");
+    return "ffmpeg";
+  }
+
+  // 2. Cached binary from a previous download
+  if (existsSync(FFMPEG_CACHED_PATH)) {
+    console.error(`Using cached ffmpeg at ${FFMPEG_CACHED_PATH}`);
+    return FFMPEG_CACHED_PATH;
+  }
+
+  // 3. Auto-download on linux x64
+  if (process.platform === "linux" && process.arch === "x64") {
+    try {
+      return await downloadFfmpeg();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `ffmpeg not found and auto-download failed: ${msg}\n` +
+          "Please install ffmpeg manually: https://ffmpeg.org/download.html",
+      );
+    }
+  }
+
+  // 4. Unsupported platform for auto-download
+  throw new Error(
+    "ffmpeg not found in PATH. Please install it:\n" +
+      "  macOS:       brew install ffmpeg\n" +
+      "  Ubuntu:      sudo apt install ffmpeg\n" +
+      "  Arch Linux:  sudo pacman -S ffmpeg\n" +
+      "  Windows:     https://github.com/BtbN/FFmpeg-Builds/releases\n" +
+      "  Or place a static ffmpeg binary at: " + FFMPEG_CACHED_PATH,
+  );
+}
 
 // ── Source parsing ───────────────────────────────────────────────────
 
@@ -89,7 +194,7 @@ function grabFrameOnce(url: string, timeoutMs: number): Promise<Buffer> {
       "pipe:1",
     ];
 
-    const proc = spawn("ffmpeg", args, {
+    const proc = spawn(ffmpegPath, args, {
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -374,10 +479,14 @@ server.resource("rtsp-sources", "rtsp://sources", async (uri) => ({
 // ── Main ─────────────────────────────────────────────────────────────
 
 async function main() {
+  // Ensure ffmpeg is available before accepting requests
+  ffmpegPath = await ensureFfmpeg();
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("rtsp-mcp-server started (stdio transport)");
   console.error(`Retry config: max=${RTSP_MAX_RETRIES}, base_delay=${RTSP_RETRY_BASE_DELAY_MS}ms`);
+  console.error(`ffmpeg path: ${ffmpegPath}`);
   if (sources.length > 0) {
     console.error(`Configured RTSP sources: ${sources.map((s) => s.name).join(", ")}`);
   } else {
