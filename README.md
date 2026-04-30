@@ -12,6 +12,7 @@ An MCP (Model Context Protocol) server for capturing single frames from RTSP cam
 - **Multiple output formats** — JPEG (default), PNG, WebP
 - **Direct URL mode** — capture from any RTSP URL without pre-configuration
 - **stdio transport** — standard MCP stdio interface, works with any MCP client
+- **Auto ffmpeg download** — automatically downloads and caches a static ffmpeg binary when not found in PATH (Linux x64/arm64, Windows x64/arm64; SHA256 verified)
 
 ## Quick Start
 
@@ -154,9 +155,30 @@ Returns a JSON list of all configured RTSP sources (credentials are masked).
 ## Requirements
 
 - Node.js >= 18
-- ffmpeg must be installed and available in `PATH`
+- ffmpeg (auto-managed — see below)
 
-### Installing ffmpeg
+## ffmpeg Management
+
+On startup the server resolves an ffmpeg binary in this order:
+
+1. **System ffmpeg** — if `ffmpeg` is found in `PATH`, it is used directly (fastest, zero setup).
+2. **Cached binary** — checks `~/.rtsp-mcp-server/bin/ffmpeg` (Linux/macOS) or `%USERPROFILE%\.rtsp-mcp-server\bin\ffmpeg.exe` (Windows) from a previous auto-download.
+3. **Auto-download** — on supported platforms, the server downloads a static GPL build from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases/tag/latest), verifies its SHA256 against the published `checksums.sha256`, and caches the binary. This only happens once; subsequent runs reuse the cache.
+
+Supported auto-download platforms:
+
+| Platform | Architecture | Archive format |
+|----------|-------------|----------------|
+| Linux | x64 | tar.xz |
+| Linux | arm64 | tar.xz |
+| Windows | x64 | zip |
+| Windows | arm64 | zip |
+
+macOS is **not** supported for auto-download (no builds are provided upstream). Install via `brew install ffmpeg`.
+
+4. **Manual install required** — on unsupported platforms, the server throws an error with install instructions.
+
+### Installing ffmpeg manually
 
 ```bash
 # macOS
@@ -167,7 +189,21 @@ sudo apt install ffmpeg
 
 # Arch Linux
 sudo pacman -S ffmpeg
+
+# Windows — download a static build from:
+# https://github.com/BtbN/FFmpeg-Builds/releases
+# Then place ffmpeg.exe in the server cache directory:
+#   %USERPROFILE%\.rtsp-mcp-server\bin\ffmpeg.exe
 ```
+
+### ffmpeg cache location
+
+| Platform | Path |
+|----------|------|
+| Linux / macOS | `~/.rtsp-mcp-server/bin/ffmpeg` |
+| Windows | `%USERPROFILE%\.rtsp-mcp-server\bin\ffmpeg.exe` |
+
+To force a fresh download, simply delete the cached binary and restart the server.
 
 ## How It Works
 
@@ -180,4 +216,4 @@ sudo pacman -S ffmpeg
 
 ## License
 
-MIT
+GPLv3

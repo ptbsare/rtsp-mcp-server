@@ -1,6 +1,6 @@
 {
   "name": "@ptbsare/rtsp-mcp-server",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "MCP server for capturing frames from RTSP streams",
   "type": "module",
   "main": "dist/index.js",
@@ -26,7 +26,7 @@
     "frame",
     "capture"
   ],
-  "license": "MIT",
+  "license": "GPL-3.0",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
     "sharp": "^0.34.2"

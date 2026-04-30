@@ -24,11 +24,39 @@ const RTSP_RETRY_BASE_DELAY_MS = (() => {
 
 // ── ffmpeg discovery & auto-download ─────────────────────────────────
 
-const FFMPEG_DOWNLOAD_URL =
-  "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz";
+const BUILDS_BASE = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest";
+
+type FfmpegBuildKey = `${typeof process.platform extends infer P ? string : string}-${typeof process.arch extends infer A ? string : string}`;
+
+interface FfmpegBuild {
+  asset: string;       // filename in the release
+  extractPath: string; // path inside the archive to the ffmpeg binary
+  isZip: boolean;      // true = zip (windows), false = tar.xz (linux)
+}
+
+function resolveBuild(): FfmpegBuild | null {
+  const p = process.platform;  // "linux" | "win32" | "darwin"
+  const a = process.arch;      // "x64" | "arm64" | ...
+
+  if (p === "linux" && a === "x64") {
+    return { asset: "ffmpeg-master-latest-linux64-gpl.tar.xz", extractPath: "ffmpeg-master-latest-linux64-gpl/bin/ffmpeg", isZip: false };
+  }
+  if (p === "linux" && a === "arm64") {
+    return { asset: "ffmpeg-master-latest-linuxarm64-gpl.tar.xz", extractPath: "ffmpeg-master-latest-linuxarm64-gpl/bin/ffmpeg", isZip: false };
+  }
+  if (p === "win32" && a === "x64") {
+    return { asset: "ffmpeg-master-latest-win64-gpl.zip", extractPath: "ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe", isZip: true };
+  }
+  if (p === "win32" && a === "arm64") {
+    return { asset: "ffmpeg-master-latest-winarm64-gpl.zip", extractPath: "ffmpeg-master-latest-winarm64-gpl/bin/ffmpeg.exe", isZip: true };
+  }
+  // macOS — no builds on BtbN, use brew or manual install
+  return null;
+}
 
 const FFMPEG_CACHE_DIR = join(homedir(), ".rtsp-mcp-server", "bin");
-const FFMPEG_CACHED_PATH = join(FFMPEG_CACHE_DIR, "ffmpeg");
+const FFMPEG_CACHED_NAME = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
+const FFMPEG_CACHED_PATH = join(FFMPEG_CACHE_DIR, FFMPEG_CACHED_NAME);
 
 /** Cached absolute path to the ffmpeg binary (resolved once at startup). */
 let ffmpegPath = "ffmpeg";
@@ -42,37 +70,112 @@ function ffmpegExists(): Promise<boolean> {
   });
 }
 
-/** Download ffmpeg-static from BtbN, extract the binary, cache it. */
-async function downloadFfmpeg(): Promise<string> {
-  console.error(`Downloading ffmpeg from ${FFMPEG_DOWNLOAD_URL} ...`);
+/** Compute SHA256 hex digest of a file. */
+async function sha256File(filePath: string): Promise<string> {
+  const { createHash } = await import("node:crypto");
+  const { createReadStream } = await import("node:fs");
+  return new Promise((resolve, reject) => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(filePath);
+    stream.on("data", (d) => hash.update(d));
+    stream.on("end", () => resolve(hash.digest("hex")));
+    stream.on("error", reject);
+  });
+}
+
+/** Download and verify SHA256 from checksums.sha256 asset. */
+async function verifyChecksum(filePath: string, expectedAsset: string): Promise<void> {
+  console.error("Verifying SHA256 checksum...");
+  const checksumsUrl = `${BUILDS_BASE}/checksums.sha256`;
+  const res = await fetch(checksumsUrl);
+  if (!res.ok) throw new Error(`Failed to fetch checksums: HTTP ${res.status}`);
+  const text = await res.text();
+
+  // Find the matching line: "hash  filename"
+  const lines = text.split("\n");
+  let expectedHash = "";
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.endsWith(expectedAsset)) {
+      expectedHash = trimmed.split(/\s+/)[0];
+      break;
+    }
+  }
+  if (!expectedHash) {
+    console.error(`Warning: checksum entry not found for ${expectedAsset}, skipping verification`);
+    return;
+  }
+
+  const actualHash = await sha256File(filePath);
+  if (actualHash !== expectedHash) {
+    throw new Error(`SHA256 mismatch for ${expectedAsset}:\n  expected: ${expectedHash}\n  actual:   ${actualHash}`);
+  }
+  console.error(`SHA256 verified: ${actualHash}`);
+}
+
+/** Download ffmpeg-static from BtbN, verify checksum, extract the binary, cache it. */
+async function downloadFfmpeg(build: FfmpegBuild): Promise<string> {
+  const url = `${BUILDS_BASE}/${build.asset}`;
+  console.error(`Downloading ffmpeg from ${url} ...`);
   mkdirSync(FFMPEG_CACHE_DIR, { recursive: true });
 
-  const res = await fetch(FFMPEG_DOWNLOAD_URL);
+  const res = await fetch(url);
   if (!res.ok || !res.body) {
     throw new Error(`Failed to download ffmpeg: HTTP ${res.status}`);
   }
 
-  // Use tar to stream-decompress and extract only the ffmpeg binary.
-  // The tarball layout is: ffmpeg-master-latest-linux64-gpl/bin/ffmpeg
-  const tarProc = spawn(
-    "tar",
-    ["-xJf", "-", "--strip-components=2", "-C", FFMPEG_CACHE_DIR, "ffmpeg-master-latest-linux64-gpl/bin/ffmpeg"],
-    { stdio: ["pipe", "ignore", "pipe"] },
-  );
+  // Save to temp file for SHA256 verification, then extract
+  const { createWriteStream } = await import("node:fs");
+  const tmpPath = join(FFMPEG_CACHE_DIR, build.asset);
 
+  // Download to temp file
   const nodeStream = Readable.fromWeb(res.body as any);
-  nodeStream.pipe(tarProc.stdin);
-
-  let stderr = "";
-  tarProc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-
   await new Promise<void>((resolve, reject) => {
-    tarProc.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`tar exited with code ${code}: ${stderr.slice(-300)}`));
-    });
-    tarProc.on("error", reject);
+    const ws = createWriteStream(tmpPath);
+    nodeStream.pipe(ws);
+    ws.on("finish", resolve);
+    ws.on("error", reject);
+    nodeStream.on("error", reject);
   });
+
+  await verifyChecksum(tmpPath, build.asset);
+
+  // Extract the ffmpeg binary from the archive
+  const binDir = FFMPEG_CACHE_DIR;
+  if (build.isZip) {
+    // Windows zip — use unzip or PowerShell
+    const { promisify } = await import("node:util");
+    const execP = promisify(execFile);
+    try {
+      await execP("unzip", ["-o", "-j", tmpPath, build.extractPath, "-d", binDir]);
+    } catch {
+      // Fallback to PowerShell if unzip not available (typical on Windows)
+      const psCmd = `Expand-Archive -Path '${tmpPath}' -DestinationPath '${binDir}' -Force; ` +
+        `Move-Item -Path '${join(binDir, build.extractPath)}' -Destination '${FFMPEG_CACHED_PATH}' -Force`;
+      await execP("powershell", ["-Command", psCmd]);
+    }
+  } else {
+    // Linux/macOS tar.xz
+    const dirName = build.extractPath.split("/")[0];
+    const tarProc = spawn(
+      "tar",
+      ["-xJf", tmpPath, "--strip-components=2", "-C", binDir, build.extractPath],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stderr = "";
+    tarProc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+    await new Promise<void>((resolve, reject) => {
+      tarProc.on("close", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`tar exited with code ${code}: ${stderr.slice(-300)}`));
+      });
+      tarProc.on("error", reject);
+    });
+  }
+
+  // Clean up temp archive
+  const { unlinkSync } = await import("node:fs");
+  try { unlinkSync(tmpPath); } catch { /* ignore */ }
 
   chmodSync(FFMPEG_CACHED_PATH, 0o755);
   console.error(`ffmpeg cached at ${FFMPEG_CACHED_PATH}`);
@@ -83,7 +186,7 @@ async function downloadFfmpeg(): Promise<string> {
  * Ensure an ffmpeg binary is available.
  *  1. Check PATH for system ffmpeg.
  *  2. Check the local cache (~/.rtsp-mcp-server/bin/ffmpeg).
- *  3. If on linux x64, auto-download from BtbN.
+ *  3. Auto-download from BtbN (linux x64/arm64, windows x64/arm64) with SHA256 verification.
  *  4. Otherwise throw with install instructions.
  */
 async function ensureFfmpeg(): Promise<string> {
@@ -99,10 +202,11 @@ async function ensureFfmpeg(): Promise<string> {
     return FFMPEG_CACHED_PATH;
   }
 
-  // 3. Auto-download on linux x64
-  if (process.platform === "linux" && process.arch === "x64") {
+  // 3. Auto-download
+  const build = resolveBuild();
+  if (build) {
     try {
-      return await downloadFfmpeg();
+      return await downloadFfmpeg(build);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       throw new Error(
@@ -112,7 +216,7 @@ async function ensureFfmpeg(): Promise<string> {
     }
   }
 
-  // 4. Unsupported platform for auto-download
+  // 4. macOS or unsupported platform
   throw new Error(
     "ffmpeg not found in PATH. Please install it:\n" +
       "  macOS:       brew install ffmpeg\n" +
