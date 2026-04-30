@@ -1,6 +1,6 @@
 {
   "name": "@ptbsare/rtsp-mcp-server",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "MCP server for capturing frames from RTSP streams",
   "type": "module",
   "main": "dist/index.js",

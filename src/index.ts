@@ -561,6 +561,252 @@ server.tool(
   },
 );
 
+// ── Tool: get_frames ─────────────────────────────────────────────────
+
+function buildGetFramesDescription(): string {
+  const lines: string[] = [
+    "Capture multiple consecutive frames from an RTSP camera stream and return them as images.",
+  ];
+
+  if (sources.length === 0) {
+    lines.push("No sources pre-configured. You must provide a full RTSP 'url' parameter.");
+  } else if (sources.length === 1) {
+    lines.push(
+      `1 source configured: "${sources[0].name}". ` +
+        `The 'server' parameter defaults to "${sources[0].name}" if omitted.`,
+    );
+  } else {
+    lines.push(`${sources.length} sources configured — pass the 'server' name or a direct 'url':`);
+    for (const s of sources) {
+      const masked = s.url.replace(/\/\/([^:]+):([^@]+)@/, "//$1:***@");
+      lines.push(`  • ${s.name} — ${masked}`);
+    }
+  }
+
+  lines.push(`Automatically retries on failure (up to ${RTSP_MAX_RETRIES} retries, exponential backoff base ${RTSP_RETRY_BASE_DELAY_MS}ms).`);
+
+  return lines.join("\n");
+}
+
+/** Grab N consecutive JPEG frames from an RTSP URL at the given fps. */
+function grabFramesOnce(
+  url: string,
+  count: number,
+  fps: number,
+  timeoutMs: number,
+): Promise<Buffer[]> {
+  return new Promise((resolve, reject) => {
+    const args = [
+      "-rtsp_transport", "tcp",
+      "-i", url,
+      "-an",
+      "-vf", `fps=${fps}`,
+      "-frames:v", String(count),
+      "-c:v", "mjpeg",
+      "-q:v", "2",
+      "-f", "image2pipe",
+      "pipe:1",
+    ];
+
+    const proc = spawn(ffmpegPath, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const chunks: Buffer[] = [];
+    let stderrData = "";
+
+    proc.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    proc.stderr.on("data", (d: Buffer) => { stderrData += d.toString(); });
+
+    const timer = setTimeout(() => proc.kill("SIGKILL"), timeoutMs);
+
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0 && code !== null) {
+        return reject(new Error(`ffmpeg exited with code ${code}: ${stderrData.slice(-300)}`));
+      }
+
+      const all = Buffer.concat(chunks);
+      if (all.length === 0) return reject(new Error("ffmpeg produced no output"));
+
+      // Split the concatenated JPEG stream into individual frames.
+      // JPEG files start with FF D8 and end with FF D9.
+      const frames: Buffer[] = [];
+      let start = -1;
+      for (let i = 0; i < all.length - 1; i++) {
+        if (all[i] === 0xff && all[i + 1] === 0xd8) {
+          start = i;
+        }
+        if (start >= 0 && all[i] === 0xff && all[i + 1] === 0xd9) {
+          frames.push(all.subarray(start, i + 2));
+          start = -1;
+        }
+      }
+
+      if (frames.length === 0) return reject(new Error("No JPEG frames found in ffmpeg output"));
+      resolve(frames);
+    });
+
+    proc.on("error", (err) => {
+      clearTimeout(timer);
+      reject(new Error(`Failed to spawn ffmpeg: ${err.message}`));
+    });
+  });
+}
+
+async function grabFramesWithRetry(
+  url: string,
+  count: number,
+  fps: number,
+  timeoutMs: number,
+): Promise<{ frames: Buffer[]; attempt: number }> {
+  let lastError: Error | undefined;
+
+  for (let attempt = 0; attempt <= RTSP_MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      const backoff = RTSP_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+      console.error(`[retry ${attempt}/${RTSP_MAX_RETRIES}] waiting ${backoff}ms...`);
+      await sleep(backoff);
+    }
+    try {
+      const frames = await grabFramesOnce(url, count, fps, timeoutMs);
+      return { frames, attempt };
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      console.error(`[attempt ${attempt + 1}/${RTSP_MAX_RETRIES + 1}] ${lastError.message}`);
+    }
+  }
+  throw lastError ?? new Error("grabFrames failed");
+}
+
+server.tool(
+  "get_frames",
+  buildGetFramesDescription(),
+  {
+    server: z
+      .string()
+      .optional()
+      .describe(buildServerParamDesc()),
+    url: z
+      .string()
+      .optional()
+      .describe(
+        "Direct RTSP URL to capture from (may include embedded credentials and query parameters). " +
+          "Overrides 'server' if both are provided.",
+      ),
+    count: z
+      .number()
+      .int()
+      .min(1)
+      .max(30)
+      .default(7)
+      .describe("Number of consecutive frames to capture (1–30, default: 7)"),
+    fps: z
+      .number()
+      .min(0.1)
+      .max(10)
+      .default(1)
+      .describe("Frames per second to capture (0.1–10, default: 1). Combined with count, determines total capture duration."),
+    format: z
+      .enum(["jpeg", "png", "webp"])
+      .default("jpeg")
+      .describe("Image output format (default: jpeg)"),
+    timeout: z
+      .number()
+      .int()
+      .min(1000)
+      .max(120000)
+      .default(30000)
+      .describe("Total capture timeout in milliseconds (1000–120000, default: 30000). Should exceed count/fps duration."),
+  },
+  async ({ server: serverName, url, count, fps, format, timeout }) => {
+    let targetUrl = url;
+
+    if (!targetUrl) {
+      if (!serverName && sources.length === 1) {
+        targetUrl = sources[0].url;
+      } else if (!serverName) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: sources.length > 0
+                ? `Please specify a 'server' name (${sources.map((s) => `"${s.name}"`).join(", ")}) or a direct 'url'.`
+                : "No RTSP sources are configured in RTSP_URLS. Please provide a 'url' parameter directly.",
+            },
+          ],
+          isError: true,
+        };
+      } else {
+        const source = sources.find((s) => s.name.toLowerCase() === serverName.toLowerCase());
+        if (!source) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Unknown server "${serverName}". Available: ${sources.map((s) => s.name).join(", ")}.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        targetUrl = source.url;
+      }
+    }
+
+    const frameCount = count ?? 7;
+    const frameFps = fps ?? 1;
+    const frameTimeout = timeout ?? 30000;
+    const outFormat = (format ?? "jpeg") as "jpeg" | "png" | "webp";
+    const mime = MIME_MAP[outFormat] ?? "image/jpeg";
+
+    try {
+      const { frames: jpegFrames, attempt } = await grabFramesWithRetry(
+        targetUrl, frameCount, frameFps, frameTimeout,
+      );
+
+      const content: Array<
+        { type: "text"; text: string } | { type: "image"; data: string; mimeType: string }
+      > = [];
+
+      if (attempt > 0) {
+        content.push({
+          type: "text" as const,
+          text: `Captured after ${attempt + 1} attempts (${attempt} ${attempt === 1 ? "retry" : "retries"}).`,
+        });
+      }
+
+      const duration = (frameCount / frameFps).toFixed(1);
+      content.push({
+        type: "text" as const,
+        text: `Captured ${jpegFrames.length} frame(s) at ${frameFps} fps over ~${duration}s.`,
+      });
+
+      for (let i = 0; i < jpegFrames.length; i++) {
+        const frame = await convertFrame(jpegFrames[i], outFormat);
+        content.push({
+          type: "image" as const,
+          data: frame.toString("base64"),
+          mimeType: mime,
+        });
+      }
+
+      return { content };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Failed to capture frames after ${RTSP_MAX_RETRIES + 1} attempts: ${message}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  },
+);
+
 // ── Resource: rtsp://sources ────────────────────────────────────────
 
 server.resource("rtsp-sources", "rtsp://sources", async (uri) => ({

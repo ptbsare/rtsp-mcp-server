@@ -146,6 +146,48 @@ Or with a direct URL:
 }
 ```
 
+### `get_frames`
+
+Capture multiple consecutive frames from an RTSP stream and return them as a sequence of images.
+
+The tool description is generated dynamically at startup — it lists every camera name configured in `RTSP_URLS`.
+
+**Parameters:**
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `server` | string | No* | — | Name of a configured RTSP source from `RTSP_URLS` |
+| `url` | string | No* | — | Direct RTSP URL (overrides `server`) |
+| `count` | integer | No | `7` | Number of frames to capture (1–30) |
+| `fps` | number | No | `1` | Frames per second (0.1–10). Total duration = count / fps |
+| `format` | `jpeg` / `png` / `webp` | No | `jpeg` | Output image format |
+| `timeout` | integer | No | `30000` | Total capture timeout in ms (1000–120000) |
+
+\* At least one of `server` or `url` is required. When only one source is configured in `RTSP_URLS`, it will be used automatically even if `server` is omitted.
+
+**Example — capture a frame every 2 seconds for 10 seconds (5 frames):**
+```json
+{
+  "name": "get_frames",
+  "arguments": {
+    "server": "front_door",
+    "count": 5,
+    "fps": 0.5
+  }
+}
+```
+
+**Example — capture 3 frames at 1-second intervals (default behavior):**
+```json
+{
+  "name": "get_frames",
+  "arguments": {
+    "server": "backyard",
+    "count": 3
+  }
+}
+```
+
 ## Resources
 
 ### `rtsp://sources`
