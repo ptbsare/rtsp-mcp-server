@@ -530,7 +530,10 @@ server.tool(
       const frame = await convertFrame(jpegFrame, outFormat);
       const mime = MIME_MAP[outFormat] ?? "image/jpeg";
 
-      const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [];
+      const content: Array<
+        | { type: "text"; text: string }
+        | { type: "image"; data: string; mimeType: string; annotations: { audience: ("user" | "assistant")[]; priority: number } }
+      > = [];
 
       if (attempt > 0) {
         content.push({
@@ -543,6 +546,10 @@ server.tool(
         type: "image" as const,
         data: frame.toString("base64"),
         mimeType: mime,
+        annotations: {
+          audience: ["user", "assistant"],
+          priority: 0.9,
+        },
       });
 
       return { content };
@@ -766,7 +773,8 @@ server.tool(
       );
 
       const content: Array<
-        { type: "text"; text: string } | { type: "image"; data: string; mimeType: string }
+        | { type: "text"; text: string }
+        | { type: "image"; data: string; mimeType: string; annotations: { audience: ("user" | "assistant")[]; priority: number } }
       > = [];
 
       if (attempt > 0) {
@@ -788,6 +796,10 @@ server.tool(
           type: "image" as const,
           data: frame.toString("base64"),
           mimeType: mime,
+          annotations: {
+            audience: ["user", "assistant"],
+            priority: 0.9,
+          },
         });
       }
 
